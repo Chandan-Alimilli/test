@@ -264,6 +264,7 @@ import numpy as np
 import time
 from summary_utils import generate_summary_from_result
 # main.py (top)
+from typing import Optional
 from pydantic import BaseModel
 from autobook_handler import run_autobook
 
@@ -317,6 +318,11 @@ app.add_middleware(
 
 # In-memory conversation context
 memory_context = []
+
+class AutoBookRequest(BaseModel):
+    prompt: str
+    limit: Optional[int] = 200
+
 
 
 @app.post("/autobook")
