@@ -1,0 +1,11 @@
+snowflake-snowpark-python==1.32.0
+spacy==3.7.4
+fuzzywuzzy==0.18.0
+python-Levenshtein==0.25.1
+python-dateutil==2.9.0.post0
+fastapi==0.115.0
+uvicorn==0.30.6
+openai-whisper==20231117
+pyaudio==0.2.14
+numpy==1.26.4
+openai==1.35.0
