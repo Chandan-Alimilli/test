@@ -1,313 +1,39 @@
-# # autobook_handler.py
-# import re
-# from datetime import datetime, timedelta
-# from typing import Dict, List, Tuple
-
-# from db import execute_sql
-# from aggregation_handler import detect_aggregation, build_aggregation_query
-# from mapper_utils import (
-#     extract_direct_column_filters,
-#     extract_comparative_filters,
-#     parse_date_range_from_prompt,
-# )
-
-# # -------------------------------
-# # AUTOBOOK “virtual table” schema
-# # -------------------------------
-# AUTOBOOK_TABLE = "AUTOBOOK_VIEW"
-
-# AUTOBOOK_COLUMNS_META: Dict[str, Dict[str, str]] = {
-#     "APPL_NB":         {"desc": "Application number",                         "type": "string"},
-#     "LOAN_VERF_BK_DT": {"desc": "Loan verification booking date",             "type": "date"},
-#     "DIR_LOC_CD":      {"desc": "Direct location code",                       "type": "string"},
-#     "PROD_TYPE_NM":    {"desc": "Product type",                               "type": "string"},
-#     "CHNL_CD":         {"desc": "Channel code",                               "type": "string"},
-#     "ORGN_CHNL_NM":    {"desc": "Origination channel name",                   "type": "string"},
-#     "BOOKED_USER":     {"desc": "User who booked the application",            "type": "string"},
-#     "EMAIL":           {"desc": "Email extracted from activity comments",     "type": "string"},
-#     "DR_USERS":        {"desc": "Users involved in DR activities (CSV)",      "type": "string"},
-#     "RE_USERS":        {"desc": "Users involved in RE activities (CSV)",      "type": "string"},
-#     "FX_USERS":        {"desc": "Users involved in FX activities (CSV)",      "type": "string"},
-# }
-
-# # ----------------------------------------
-# # Hard-coded business rule (= CAFVASC)
-# # ----------------------------------------
-# BUSINESS_RULES: List[Tuple[re.Pattern, str]] = [
-#     # autobook
-#     (re.compile(r"\bauto[- ]?book\b|\bcfsin\b", re.I), "BOOKED_USER = 'CAFVASC'"),
-#     # manual
-#     (re.compile(r"\bmanual\b|\bagent booked\b|\bhuman\b", re.I), "BOOKED_USER <> 'CAFVASC'"),
-# ]
-
-# # Optional normalizers so “loan/retail/subaru/land rover” convert to exact equals
-# NORMALIZE_EQ = {
-#     "PROD_TYPE_NM": {
-#         r"\bloan(s)?\b": "LOAN",
-#         r"\blease(s)?\b": "LEASE",
-#     },
-#     "ORGN_CHNL_NM": {
-#         r"\bretail\b": "RETAIL",
-#         r"\bsubaru\b": "SUBARU",
-#         r"\bland\s*rover\b": "LAND ROVER",
-#     },
-# }
-
-# DEFAULT_WINDOW_DAYS = 30
-
-
-# def _infer_dates(prompt: str) -> Tuple[str, str]:
-#     dr = parse_date_range_from_prompt(prompt)
-#     if dr and dr.get("from") and dr.get("to"):
-#         return dr["from"], dr["to"]
-#     # fallback: current month window (or last 30 days)
-#     today = datetime.utcnow().date()
-#     start = today.replace(day=1)
-#     return start.isoformat(), today.isoformat()
-
-
-# def _business_clauses(prompt: str) -> List[str]:
-#     clauses = []
-#     for rx, clause in BUSINESS_RULES:
-#         if rx.search(prompt):
-#             clauses.append(clause)
-#     return clauses
-
-
-# def _normalized_equals_from_prompt(prompt: str) -> List[str]:
-#     eqs = []
-#     for col, rx_map in NORMALIZE_EQ.items():
-#         for rx, val in rx_map.items():
-#             if re.search(rx, prompt, re.I):
-#                 eqs.append(f"{col} = '{val}'")
-#     return eqs
-
-
-# # -------------------------
-# # DNA base query (cleaned)
-# # -------------------------
-# BASE_CTE = """
-# WITH First_DR_Transaction AS (
-#   SELECT
-#     dsi.APPL_NB,
-#     MIN(orgn.ACTV_TS) AS FIRST_DR_ACTV_TS
-#   FROM PROD_110575_ICDW_DB.AUTO_V.AFNC_DSI_ORGN_ACCT_DY dsi
-#   JOIN PROD_110575_ICDW_DB.AUTO_V.AFNC_DSI_ORGN_ACTV_DY_SUM orgn
-#     ON orgn.AUTO_FNCE_ORGN_DIM_ID = dsi.AUTO_FNCE_ORGN_DIM_ID
-#   WHERE orgn.ACTV_TYPE_CD = 'DR'
-#     AND dsi.LOAN_VERF_BK_DT BETWEEN '{FROM}' AND '{TO}'
-#     AND dsi.SNPST_DT = (
-#       SELECT MAX(SNPST_DT)
-#       FROM PROD_110575_ICDW_DB.AUTO_V.AFNC_DSI_ORGN_ACCT_DY
-#     )
-#     AND dsi.APPL_EXCL_IN = 1
-#     AND dsi.BK_IN = 1
-#   GROUP BY dsi.APPL_NB
-# ),
-# Booked_User_CTE AS (
-#   SELECT
-#     dsi.APPL_NB,
-#     MAX(CASE WHEN orgn.ACTV_TYPE_CD IN ('BK','PM') THEN orgn.ADJC_DCSN_USR_ID END) AS BOOKED_USER
-#   FROM PROD_110575_ICDW_DB.AUTO_V.AFNC_DSI_ORGN_ACCT_DY dsi
-#   JOIN PROD_110575_ICDW_DB.AUTO_V.AFNC_DSI_ORGN_ACTV_DY_SUM orgn
-#     ON orgn.AUTO_FNCE_ORGN_DIM_ID = dsi.AUTO_FNCE_ORGN_DIM_ID
-#   WHERE dsi.LOAN_VERF_BK_DT BETWEEN '{FROM}' AND '{TO}'
-#     AND dsi.SNPST_DT = (
-#       SELECT MAX(SNPST_DT)
-#       FROM PROD_110575_ICDW_DB.AUTO_V.AFNC_DSI_ORGN_ACCT_DY
-#     )
-#     AND dsi.APPL_EXCL_IN = 1
-#     AND dsi.BK_IN = 1
-#   GROUP BY dsi.APPL_NB
-# )
-# """
-
-# BASE_SELECT = """
-# SELECT
-#   dsi.APPL_NB,
-#   MAX(dsi.LOAN_VERF_BK_DT) AS LOAN_VERF_BK_DT,
-#   MAX(dsi.DIR_LOC_CD)      AS DIR_LOC_CD,
-#   MAX(dsi.PROD_TYPE_NM)    AS PROD_TYPE_NM,
-#   MAX(dsi.CHNL_CD)         AS CHNL_CD,
-#   MAX(dsi.ORGN_CHNL_NM)    AS ORGN_CHNL_NM,
-#   bu.BOOKED_USER           AS BOOKED_USER,
-#   MAX(CASE
-#         WHEN bu.BOOKED_USER IN ('CAFVASC','CAFECON')
-#          AND orgn.ADJC_DCSN_USR_ID IN ('CAFVASC','CAFECON')
-#          AND orgn.ACTV_ADDL_CMNT_TX ILIKE '%@%'
-#       THEN orgn.ACTV_ADDL_CMNT_TX
-#   END) AS EMAIL,
-#   LISTAGG(CASE WHEN orgn.ACTV_TYPE_CD = 'DR' THEN orgn.ADJC_DCSN_USR_ID END, ', ')
-#     WITHIN GROUP (ORDER BY orgn.ADJC_DCSN_USR_ID) AS DR_USERS,
-#   LISTAGG(CASE WHEN orgn.ACTV_TYPE_CD = 'RC' THEN orgn.ADJC_DCSN_USR_ID END, ', ')
-#     WITHIN GROUP (ORDER BY orgn.ADJC_DCSN_USR_ID) AS RE_USERS,
-#   LISTAGG(CASE WHEN orgn.ACTV_TYPE_CD = 'FX' THEN orgn.ADJC_DCSN_USR_ID END, ' ')
-#     WITHIN GROUP (ORDER BY orgn.ADJC_DCSN_USR_ID) AS FX_USERS
-# FROM PROD_110575_ICDW_DB.AUTO_V.AFNC_DSI_ORGN_ACCT_DY dsi
-# JOIN First_DR_Transaction fdr
-#   ON dsi.APPL_NB = fdr.APPL_NB
-# JOIN PROD_110575_ICDW_DB.AUTO_V.AFNC_DSI_ORGN_ACTV_DY_SUM orgn
-#   ON orgn.AUTO_FNCE_ORGN_DIM_ID = dsi.AUTO_FNCE_ORGN_DIM_ID
-# LEFT JOIN PROD_110575_ICDW_DB.AUTO_V.AFNC_BF_ORGN_CNTRCT_EXCP_DY excpt
-#   ON dsi.APPL_NB = excpt.APPL_NB
-# JOIN Booked_User_CTE bu
-#   ON dsi.APPL_NB = bu.APPL_NB
-# WHERE dsi.LOAN_VERF_BK_DT BETWEEN '{FROM}' AND '{TO}'
-#   AND dsi.SNPST_DT = (
-#     SELECT MAX(SNPST_DT)
-#     FROM PROD_110575_ICDW_DB.AUTO_V.AFNC_DSI_ORGN_ACCT_DY
-#   )
-#   AND dsi.APPL_EXCL_IN = 1
-#   AND dsi.BK_IN = 1
-#   AND orgn.ACTV_TS >= fdr.FIRST_DR_ACTV_TS
-# GROUP BY dsi.APPL_NB, bu.BOOKED_USER
-# """
-
-# def _materialize_view(from_date: str, to_date: str) -> str:
-#     return (
-#         BASE_CTE.format(FROM=from_date, TO=to_date)
-#         + "\n, "
-#         + AUTOBOOK_TABLE
-#         + " AS (\n"
-#         + BASE_SELECT.format(FROM=from_date, TO=to_date)
-#         + "\n)"
-#     )
-
-
-# def build_autobook_sql(prompt: str, limit_hint: int | None = 200) -> str:
-#     # 1) dates
-#     from_dt, to_dt = _infer_dates(prompt)
-
-#     # 2) materialize virtual table
-#     with_view = _materialize_view(from_dt, to_dt)
-
-#     # 3) build WHERE parts
-#     where_clauses: List[str] = []
-#     where_clauses += _business_clauses(prompt)
-
-#     # strict equals from your direct-filter extractor (authorized columns)
-#     comparative_filters, filtered_cols = extract_comparative_filters(prompt, AUTOBOOK_COLUMNS_META)
-#     direct_filters = extract_direct_column_filters(prompt, AUTOBOOK_COLUMNS_META, filtered_columns=filtered_cols)
-
-#     # ensure normalization like “loan/retail/subaru” → equals
-#     norm_equality = _normalized_equals_from_prompt(prompt)
-
-#     # Only allow filters on declared columns
-#     all_filters = list(dict.fromkeys(list(comparative_filters) + list(direct_filters) + norm_equality))
-
-#     # 4) aggregation?
-#     agg_func, agg_col = detect_aggregation(prompt, AUTOBOOK_COLUMNS_META)
-
-#     if agg_func:
-#         # percentage & others handled exactly like mapper flow
-#         percentage_condition = None
-#         percentage_denominator_condition = None
-
-#         # Let build_aggregation_query craft SELECT ... FROM AUTOBOOK_VIEW ...
-#         query = build_aggregation_query(
-#             agg_func,
-#             agg_col,
-#             AUTOBOOK_TABLE,
-#             prompt,
-#             AUTOBOOK_COLUMNS_META,
-#             percentage_condition,
-#             percentage_denominator_condition
-#         )
-
-#         # Inject WHERE (same approach you use in mapper)
-#         if where_clauses or all_filters:
-#             where_sql = " WHERE " + " AND ".join(where_clauses + all_filters)
-#             import re as _re
-#             query = _re.sub(r"\bWHERE\b.*?(LIMIT|$)", where_sql, query, flags=_re.IGNORECASE) or query + where_sql
-
-#         # Apply limit if your builder didn’t
-#         if "LIMIT" not in query.upper() and limit_hint:
-#             query += f" LIMIT {int(limit_hint)}"
-
-#         return f"{with_view}\n{query}"
-
-#     # 5) non-aggregation SELECT
-#     select_cols = ", ".join(AUTOBOOK_COLUMNS_META.keys())
-#     outer = [f"SELECT {select_cols} FROM {AUTOBOOK_TABLE}"]
-#     if where_clauses or all_filters:
-#         outer.append("WHERE " + " AND ".join(where_clauses + all_filters))
-#     if limit_hint:
-#         outer.append(f"LIMIT {int(limit_hint)}")
-
-#     return f"{with_view}\n" + "\n".join(outer)
-
-
-# def run_autobook(prompt: str, limit: int | None = 200):
-#     sql = build_autobook_sql(prompt, limit_hint=limit)
-#     rows = execute_sql(sql)
-#     return rows, sql
-
-
-
-
-
-
 # autobook_handler.py
+"""
+AutoBook handler — filters & aggregates applied directly on the DNA base query.
+
+- Injects extra AND ... into the OUTER WHERE of the default query (raw columns).
+- "Autobook" → bu.BOOKED_USER IN AUTBOOK_USER_CODES
+- "Manual"   → COALESCE(bu.BOOKED_USER,'') NOT IN AUTBOOK_USER_CODES
+- Other filters bind to dsi.PROD_TYPE_NM, dsi.ORGN_CHNL_NM, dsi.CHNL_CD, dsi.DIR_LOC_CD.
+- Date phrases (this month, previous month, yesterday, from..to, on <date>, last N days) handled here.
+- Aggregations wrap the SAME base SQL (never a custom table).
+- Prints & logs the exact SQL executed.
+"""
+
 import re
-from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+import calendar
+import logging
+from datetime import datetime, timedelta
+from typing import Optional, Tuple, List
 
-# --- Reuse the same project utilities used by mapper ---
+# --- configure logging ---
+logger = logging.getLogger("autobook")
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO)
+
+# --- your DB executor ---
 from db import execute_sql
-from mapper_utils import (
-    extract_direct_column_filters,
-    extract_comparative_filters,
-    parse_date_range_from_prompt,
-)
-from prompt_utils import extract_limit_from_prompt
-from aggregation_handler import detect_aggregation, build_aggregation_query
 
-# -------------------------------------------------------
-# Virtual table name + column metadata (UPPERCASE columns)
-# -------------------------------------------------------
-AUTOBOOK_TABLE = "AUTOBOOK_VIEW"
+# =========================
+# CONFIG: Autobook user codes
+# =========================
+# Adjust this list to whatever the DNA/business team certify as "autobook" booking users.
+AUTBOOK_USER_CODES = ("CAFVASC", "CEIFS", "CFSIN")
 
-AUTOBOOK_COLUMNS_META: Dict[str, Dict[str, str]] = {
-    "APPL_NB":         {"desc": "Application number",                         "type": "string"},
-    "LOAN_VERF_BK_DT": {"desc": "Loan verification booking date",             "type": "date"},
-    "DIR_LOC_CD":      {"desc": "Direct location code",                       "type": "string"},
-    "PROD_TYPE_NM":    {"desc": "Product type",                               "type": "string"},
-    "CHNL_CD":         {"desc": "Channel code",                               "type": "string"},
-    "ORGN_CHNL_NM":    {"desc": "Origination channel name",                   "type": "string"},
-    "BOOKED_USER":     {"desc": "User who booked the application",            "type": "string"},
-    "EMAIL":           {"desc": "Email extracted from activity comments",     "type": "string"},
-    "DR_USERS":        {"desc": "Users involved in DR activities (CSV)",      "type": "string"},
-    "RE_USERS":        {"desc": "Users involved in RE activities (CSV)",      "type": "string"},
-    "FX_USERS":        {"desc": "Users involved in FX activities (CSV)",      "type": "string"},
-}
-
-# -------------------------------------------------------
-# Hard-coded business mapping (as requested)
-#   - "autobook"  -> BOOKED_USER = 'CAFVASC'
-#   - "manual"    -> BOOKED_USER <> 'CAFVASC'
-# -------------------------------------------------------
-_BUSINESS_RULES: List[Tuple[re.Pattern, str]] = [
-    (re.compile(r"\bauto[- ]?book\b|\bcfsin\b", re.I), "BOOKED_USER = 'CAFVASC'"),
-    (re.compile(r"\bmanual\b|\bagent booked\b|\bhuman\b", re.I), "BOOKED_USER <> 'CAFVASC'"),
-]
-
-# Optional normalizers so free-text maps to strict equals for the two direct-filter columns
-_NORMALIZE_EQ: Dict[str, Dict[str, str]] = {
-    "PROD_TYPE_NM": {
-        r"\bloan(s)?\b": "LOAN",
-        r"\blease(s)?\b": "LEASE",
-    },
-    "ORGN_CHNL_NM": {
-        r"\bretail\b": "RETAIL",
-        r"\bsubaru\b": "SUBARU",
-        r"\bland\s*rover\b": "LAND ROVER",
-    },
-}
-
-# -------------------------------------
-# DNA base query (cleaned + parameterized)
-# We inline FROM/TO as ISO dates (Snowflake/ANSI style).
-# -------------------------------------
+# =========================
+# DNA TEAM DEFAULT QUERY
+# =========================
 _BASE_CTE = """
 WITH First_DR_Transaction AS (
   SELECT
@@ -382,159 +108,283 @@ WHERE dsi.LOAN_VERF_BK_DT BETWEEN '{FROM}' AND '{TO}'
   AND dsi.APPL_EXCL_IN = 1
   AND dsi.BK_IN = 1
   AND orgn.ACTV_TS >= fdr.FIRST_DR_ACTV_TS
+-- ##EXTRA_WHERE##   -- extra AND ... will be injected here
 GROUP BY dsi.APPL_NB, bu.BOOKED_USER
 """
 
-# ---------------------------
-# Helpers
-# ---------------------------
-def _infer_date_window(prompt: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Use the same parser as mapper. Returns (from_iso, to_iso) or (None, None) if no range.
-    """
-    dr = parse_date_range_from_prompt(prompt)
-    if dr and dr.get("from") and dr.get("to"):
-        return dr["from"], dr["to"]
-    return None, None  # keep None so LIMIT fallback matches mapper behavior
+# =========================
+# Date parsing (self-contained)
+# =========================
+_MONTH_WORDS = {
+    "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
+    "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
+    "august": 8, "aug": 8, "september": 9, "sep": 9, "sept": 9,
+    "october": 10, "oct": 10, "november": 11, "nov": 11, "december": 12, "dec": 12,
+}
 
-def _business_where(prompt: str) -> List[str]:
-    where: List[str] = []
-    for rx, clause in _BUSINESS_RULES:
-        if rx.search(prompt):
-            where.append(clause)
-    return where
+def _month_bounds(year: int, month: int) -> Tuple[str, str]:
+    start = datetime(year, month, 1).date()
+    last_day = calendar.monthrange(year, month)[1]
+    end = datetime(year, month, last_day).date()
+    return start.isoformat(), end.isoformat()
 
-def _normalized_equals_from_prompt(prompt: str) -> List[str]:
-    """
-    Safety net so phrases like 'product type loan' / 'channel retail'
-    become strict equals even if direct filter extractor misses them.
-    """
-    eqs: List[str] = []
-    for col, rx_map in _NORMALIZE_EQ.items():
-        for rx, val in rx_map.items():
-            if re.search(rx, prompt, re.I):
-                eqs.append(f"{col} = '{val}'")
-    return eqs
-
-def _materialize_view(from_date: str, to_date: str) -> str:
-    return (
-        _BASE_CTE.format(FROM=from_date, TO=to_date)
-        + "\n, "
-        + AUTOBOOK_TABLE
-        + " AS (\n"
-        + _BASE_SELECT.format(FROM=from_date, TO=to_date)
-        + "\n)"
-    )
-
-# ---------------------------
-# Public API
-# ---------------------------
-def build_autobook_sql(prompt: str, limit_hint: Optional[int] = None) -> str:
-    """
-    Build final SQL for the /autobook route, reusing the same mechanics as mapper:
-    - date parsing (mapper_utils.parse_date_range_from_prompt)
-    - business terms mapping (hard-coded CAFVASC rule here)
-    - direct/comparative filters (mapper_utils)
-    - aggregation (aggregation_handler)
-    - prompt-based LIMIT (prompt_utils.extract_limit_from_prompt)
-    """
-    prompt_lower = prompt.lower()
-
-    # 1) Dates
-    from_dt, to_dt = _infer_date_window(prompt)
-    # If no dates in prompt, use FIRST-OF-CURRENT-MONTH..TODAY inside the materialized view
-    # (keeps typical month window while still honoring mapper's default-limit behavior outside)
-    if not (from_dt and to_dt):
-        today = datetime.utcnow().date()
-        from_dt = today.replace(day=1).isoformat()
-        to_dt = today.isoformat()
-
-    # 2) Build the virtual table
-    with_view = _materialize_view(from_dt, to_dt)
-
-    # 3) WHERE clauses from business rules + filters
-    where_clauses: List[str] = []
-    where_clauses += _business_where(prompt)
-
-    # Allow only declared columns (same pattern mapper uses)
-    comparative_filters, filtered_cols = extract_comparative_filters(prompt, AUTOBOOK_COLUMNS_META)
-    direct_filters = extract_direct_column_filters(
-        prompt,
-        AUTOBOOK_COLUMNS_META,
-        filtered_columns=filtered_cols
-    )
-    normalized_equals = _normalized_equals_from_prompt(prompt)
-
-    # Collapse duplicates while keeping order
-    all_filters = list(dict.fromkeys(list(comparative_filters) + list(direct_filters) + normalized_equals))
-
-    # 4) Aggregation detection (same API as mapper)
+def _coerce_date(token: str) -> Optional[str]:
     try:
-        agg_func, agg_col = detect_aggregation(prompt, AUTOBOOK_COLUMNS_META)
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", token):
+            return datetime.strptime(token, "%Y-%m-%d").date().isoformat()
+        if re.match(r"^\d{1,2}/\d{1,2}/\d{2,4}$", token):
+            fmt = "%d/%m/%Y" if len(token.split("/")[-1]) == 4 else "%d/%m/%y"
+            return datetime.strptime(token, fmt).date().isoformat()
+        if re.match(r"^\d{1,2}-\d{1,2}-\d{2,4}$", token):
+            fmt = "%d-%m-%Y" if len(token.split("-")[-1]) == 4 else "%d-%m-%y"
+            return datetime.strptime(token, fmt).date().isoformat()
     except Exception:
-        agg_func, agg_col = None, None
+        return None
+    return None
 
-    # Prompt-based LIMIT (same behavior as mapper)
-    extracted_limit = extract_limit_from_prompt(prompt)  # default in your util is 50
-    # If the caller explicitly passes a limit (e.g., via JSON body), that wins
-    if limit_hint is not None:
-        extracted_limit = int(limit_hint)
+def parse_date_range_from_prompt(prompt: str) -> Tuple[str, str]:
+    txt = " ".join((prompt or "").lower().split())
+    today = datetime.utcnow().date()
 
-    # 5) Aggregation path
-    if agg_func:
-        # percentage args are kept None here; your build_aggregation_query already handles them
-        percentage_condition = None
-        percentage_denominator_condition = None
+    date_token = r"(?:\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})"
 
-        query = build_aggregation_query(
-            agg_func,
-            agg_col,
-            AUTOBOOK_TABLE,
-            prompt,
-            AUTOBOOK_COLUMNS_META,
-            percentage_condition,
-            percentage_denominator_condition
-        )
+    m = re.search(rf"\bbetween\s+({date_token})\s+and\s+({date_token})\b", txt)
+    if m:
+        a, b = _coerce_date(m.group(1)), _coerce_date(m.group(2))
+        if a and b:
+            return (a, b) if a <= b else (b, a)
 
-        # Inject WHERE
-        if where_clauses or all_filters:
-            where_sql = " WHERE " + " AND ".join(where_clauses + all_filters)
-            # Try to replace an existing WHERE; otherwise append
-            m = re.search(r"\bWHERE\b", query, flags=re.IGNORECASE)
-            if m:
-                query = re.sub(r"\bWHERE\b.*?(LIMIT|$)", where_sql + r" \1", query, flags=re.IGNORECASE)
-            else:
-                query += where_sql
+    m = re.search(rf"\bfrom\s+({date_token})\s+(?:to|through|-)\s+({date_token})\b", txt)
+    if m:
+        a, b = _coerce_date(m.group(1)), _coerce_date(m.group(2))
+        if a and b:
+            return (a, b) if a <= b else (b, a)
 
-        # LIMIT: if user specified a limit (different from default 50) OR there was no date range in the prompt,
-        # mirror mapper’s behavior.
-        if "LIMIT" not in query.upper():
-            if extracted_limit != 50:
-                query += f" LIMIT {extracted_limit}"
-            elif not parse_date_range_from_prompt(prompt):  # only apply default when no explicit date range in prompt
-                query += " LIMIT 50"
+    m = re.search(rf"\bon\s+({date_token})\b", txt)
+    if m:
+        d = _coerce_date(m.group(1))
+        if d: return d, d
 
-        return f"{with_view}\n{query}"
+    if "yesterday" in txt:
+        y = (today - timedelta(days=1)).isoformat()
+        return y, y
+    if "today" in txt:
+        t = today.isoformat()
+        return t, t
 
-    # 6) Non-aggregation SELECT
-    selected_cols = ", ".join(AUTOBOOK_COLUMNS_META.keys())
-    outer = [f"SELECT {selected_cols} FROM {AUTOBOOK_TABLE}"]
-    if where_clauses or all_filters:
-        outer.append("WHERE " + " AND ".join(where_clauses + all_filters))
+    m = re.search(r"\b(last|past)\s+(\d{1,3})\s+day(s)?\b", txt)
+    if m:
+        n = max(1, int(m.group(2)))
+        start = (today - timedelta(days=n - 1)).isoformat()
+        return start, today.isoformat()
 
-    # LIMIT (same logic as aggregation branch)
-    if extracted_limit != 50:
-        outer.append(f"LIMIT {extracted_limit}")
-    elif not parse_date_range_from_prompt(prompt):
-        outer.append("LIMIT 50")
+    if "this week" in txt:
+        start = today - timedelta(days=today.weekday())
+        end = start + timedelta(days=6)
+        return start.isoformat(), end.isoformat()
+    if "last week" in txt or "previous week" in txt:
+        end = today - timedelta(days=today.weekday() + 1)
+        start = end - timedelta(days=6)
+        return start.isoformat(), end.isoformat()
 
-    return f"{with_view}\n" + "\n".join(outer)
+    if "this month" in txt or "current month" in txt:
+        return _month_bounds(today.year, today.month)
+    if "previous month" in txt or "last month" in txt:
+        y, mth = today.year, today.month - 1
+        if mth == 0: y, mth = y - 1, 12
+        return _month_bounds(y, mth)
+
+    for w, mnum in _MONTH_WORDS.items():
+        if re.search(rf"\b{w}\b", txt):
+            year = today.year
+            ym = re.search(rf"{w}\s+(\d{{4}})", txt)
+            if ym: year = int(ym.group(1))
+            return _month_bounds(year, mnum)
+
+    # default safe window: current month
+    return _month_bounds(today.year, today.month)
+
+# =========================
+# Prompt filters & limit
+# =========================
+
+def extract_limit_from_prompt(prompt: str) -> int:
+    txt = " ".join((prompt or "").lower().split())
+    m = (re.search(r"\blimit\s+(\d+)\b", txt) or
+         re.search(r"\btop\s+(\d+)\b", txt) or
+         re.search(r"\bfirst\s+(\d+)\b", txt) or
+         re.search(r"\bhead\s+(\d+)\b", txt))
+    if m:
+        try:
+            n = int(m.group(1))
+            return max(1, min(n, 10000))
+        except Exception:
+            pass
+    return 50
+
+def _sanitize_literal(value: str) -> str:
+    """Uppercase and allow alnum, space, -_/& only; collapse spaces."""
+    v = re.sub(r"[^A-Za-z0-9 _\-\/&]", "", value or "").upper().strip()
+    v = re.sub(r"\s+", " ", v)
+    return v
+
+def parse_filters_to_raw_columns(prompt: str) -> List[str]:
+    """
+    Convert English to SQL conditions AGAINST RAW COLUMNS in the base query:
+      - bu.BOOKED_USER (autobook/manual)
+      - dsi.ORGN_CHNL_NM, dsi.PROD_TYPE_NM, dsi.CHNL_CD, dsi.DIR_LOC_CD
+    Returns list of SQL expressions WITHOUT leading AND.
+    """
+    txt = " ".join((prompt or "").lower().split())
+    conds: List[str] = []
+
+    # ---- autobook / manual
+    if re.search(r"\bauto[- ]?book", txt) or re.search(r"\bcfsin\b", txt) or re.search(r"\bceifs\b", txt):
+        in_list = ", ".join(f"'{c}'" for c in AUTBOOK_USER_CODES)
+        conds.append(f"bu.BOOKED_USER IN ({in_list})")
+    if re.search(r"\bmanual\b|\bagent booked\b|\bhuman\b", txt):
+        in_list = ", ".join(f"'{c}'" for c in AUTBOOK_USER_CODES)
+        conds.append(f"COALESCE(bu.BOOKED_USER,'') NOT IN ({in_list})")
+
+    # ---- product type (loan/lease or explicit)
+    m = re.search(r"\b(product\s*type|prod\s*type|type)\s*(is|=)?\s*([a-z ]+)\b", txt)
+    if m:
+        val = _sanitize_literal(m.group(3))
+        if "LOAN" in val: conds.append("dsi.PROD_TYPE_NM = 'LOAN'")
+        elif "LEASE" in val: conds.append("dsi.PROD_TYPE_NM = 'LEASE'")
+        else: conds.append(f"dsi.PROD_TYPE_NM = '{val}'")
+    else:
+        if re.search(r"\bloan(s)?\b", txt) and "dsi.PROD_TYPE_NM = 'LOAN'" not in conds:
+            conds.append("dsi.PROD_TYPE_NM = 'LOAN'")
+        if re.search(r"\blease(s)?\b", txt) and "dsi.PROD_TYPE_NM = 'LEASE'" not in conds:
+            conds.append("dsi.PROD_TYPE_NM = 'LEASE'")
+
+    # ---- origination channel name (aka original channel name)
+    m = re.search(r"\b(origination|original)\s*channel\s*(name)?\s*(is|=)?\s*([a-z &/-]+)\b", txt)
+    if m:
+        val = _sanitize_literal(m.group(4))
+        # common synonyms
+        if "RETAIL" in val: val = "RETAIL"
+        if "SUBARU" in val: val = "SUBARU"
+        conds.append(f"dsi.ORGN_CHNL_NM = '{val}'")
+    else:
+        if re.search(r"\bchannel\b.*\bretail\b", txt) and "dsi.ORGN_CHNL_NM = 'RETAIL'" not in conds:
+            conds.append("dsi.ORGN_CHNL_NM = 'RETAIL'")
+
+    # ---- channel code (CHNL_CD)
+    m = re.search(r"\bchannel\s*code\s*(is|=)?\s*([a-z0-9]+)\b", txt)
+    if m:
+        val = _sanitize_literal(m.group(2))
+        conds.append(f"dsi.CHNL_CD = '{val}'")
+
+    # ---- direct location code (DIR_LOC_CD)
+    m = re.search(r"\b(dir(?:ect)?\s*loc(?:ation)?\s*code|dir[_ ]?loc[_ ]?cd)\s*(is|=)?\s*([a-z0-9]+)\b", txt)
+    if m:
+        val = _sanitize_literal(m.group(3))
+        conds.append(f"dsi.DIR_LOC_CD = '{val}'")
+
+    # de-duplicate (preserve order)
+    seen = set()
+    out = []
+    for c in conds:
+        if c not in seen:
+            out.append(c); seen.add(c)
+    return out
+
+# =========================
+# Aggregation helpers
+# =========================
+_GROUPABLE = {
+    "channel": "ORGN_CHNL_NM",
+    "product": "PROD_TYPE_NM",
+    "product type": "PROD_TYPE_NM",
+    "booked user": "BOOKED_USER",
+    "dir loc": "DIR_LOC_CD",
+    "dir loc code": "DIR_LOC_CD",
+    "dir location": "DIR_LOC_CD",
+}
+
+def wants_count(prompt: str) -> bool:
+    t = " ".join((prompt or "").lower().split())
+    return bool(re.search(r"\bhow many\b|\bcount\b|\bnumber of\b|\bno\.?\s+of\b", t))
+
+def group_by_column(prompt: str) -> Optional[str]:
+    t = " ".join((prompt or "").lower().split())
+    m = re.search(r"\bby\s+([a-z _]+)\b", t)
+    if not m:
+        return None
+    key = m.group(1).strip()
+    for k, col in _GROUPABLE.items():
+        if k in key:
+            return col
+    if key.upper() in ("ORGN_CHNL_NM", "PROD_TYPE_NM", "BOOKED_USER", "DIR_LOC_CD"):
+        return key.upper()
+    return None
+
+# =========================
+# SQL assembly
+# =========================
+def _inject_extra_where(base_select_sql: str, extra_conditions: List[str]) -> str:
+    """
+    Insert extra AND ... into the existing WHERE block (before GROUP BY).
+    The base SELECT has a marker, but we also fall back to regex if needed.
+    """
+    if not extra_conditions:
+        return base_select_sql
+    extra = "  AND " + " AND ".join(extra_conditions) + "\n"
+    if "-- ##EXTRA_WHERE##" in base_select_sql:
+        return base_select_sql.replace("-- ##EXTRA_WHERE##", extra.strip("\n"))
+    return re.sub(r"(WHERE\b[\s\S]*?)(\bGROUP BY\b)", r"\1" + extra + r"\2",
+                  base_select_sql, flags=re.IGNORECASE)
+
+def build_autobook_sql(prompt: str, limit_hint: Optional[int] = None) -> str:
+    # 1) Date window
+    frm, to = parse_date_range_from_prompt(prompt)
+    logger.info(f"AUTOBOOK date window: {frm} -> {to}")
+
+    # 2) Parse filters → RAW columns
+    extra_where = parse_filters_to_raw_columns(prompt)
+
+    # 3) Assemble base SQL with date substitutions and filter injection
+    cte = _BASE_CTE.format(FROM=frm, TO=to)
+    select_with_filters = _inject_extra_where(_BASE_SELECT.format(FROM=frm, TO=to), extra_where)
+
+    # 4) Limit
+    limit_val = limit_hint if limit_hint is not None else extract_limit_from_prompt(prompt)
+
+    # 5) Aggregation?
+    if wants_count(prompt):
+        grp = group_by_column(prompt)
+        if grp:
+            final = f"""
+{cte}
+, AUTBOOK_BASE AS (
+{select_with_filters}
+)
+SELECT {grp}, COUNT(*) AS CNT
+FROM AUTBOOK_BASE
+GROUP BY {grp}
+ORDER BY CNT DESC
+LIMIT {limit_val}
+""".strip()
+        else:
+            final = f"""
+{cte}
+SELECT COUNT(*) AS CNT
+FROM (
+{select_with_filters}
+) t
+""".strip()
+    else:
+        final = (cte + "\n" + select_with_filters).strip()
+        if limit_val:
+            final += f"\nLIMIT {int(limit_val)}"
+
+    print("\n[AutoBook Generated SQL]\n", final)
+    logger.info("Generated SQL:\n%s", final)
+    return final
 
 def run_autobook(prompt: str, limit: Optional[int] = None):
-    """
-    Execute the AutoBook query and return (rows, sql).
-    `limit` (if provided) overrides the prompt-derived limit.
-    """
     sql = build_autobook_sql(prompt, limit_hint=limit)
     rows = execute_sql(sql)
     return rows, sql
