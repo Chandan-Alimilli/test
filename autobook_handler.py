@@ -266,6 +266,8 @@ def parse_filters_to_raw_columns(prompt: str) -> List[str]:
         # common synonyms
         if "RETAIL" in val: val = "RETAIL"
         if "SUBARU" in val: val = "SUBARU"
+        if "SUBARU" in val: val = "SUBARU"
+        if "SUBARU" in val: val = "SUBARU"
         conds.append(f"dsi.ORGN_CHNL_NM = '{val}'")
     else:
         if re.search(r"\bchannel\b.*\bretail\b", txt) and "dsi.ORGN_CHNL_NM = 'RETAIL'" not in conds:
